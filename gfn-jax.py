@@ -6,8 +6,8 @@ defined in Figure 2 of the GFlowNet Foundations paper, Bengio et al (JMLR, 2023)
 """
 
 """
-Key differences with rl.py:
-- JAX instead of PyTorch
+Key differences with gfn.py:
+- JAX and Equinox instead of PyTorch (could have used pure JAX but Equinox makes the syntax closer to PyTorch plus it handles basic things like parameter initialization and model updates)
 - JAX is hardware agnostic (CPU/GPU/TPU), thus we don't need to specify device
 - JAX builds its function around a single input then extends to batches using vmap
 - Since JAX is built around functional programming, we will avoid classes when possible otherwise we will need to explicitely define its PyTree
@@ -20,6 +20,8 @@ Key differences with rl.py:
 import jax
 import jax.numpy as jnp
 from jax import random, grad, jit, vmap
+from jaxtyping import Array, Float, Int, Scalar
+
 
 import optax
 import equinox as eqx
@@ -31,12 +33,9 @@ import time
 
 float_type = jnp.float32
 key = random.PRNGKey(0)
-do_print = True
+do_print = False
 
 ### ENVIRONMENT ###
-
-discount_factor = 1.0 # No discounting
-batch_size = 1
 
 # A dictionary of connections: the keys of the dictionary are the indices of the
 # states, and the values are the indices of the states to which each state is
@@ -105,21 +104,22 @@ optimizer_state = optimizer.init(eqx.filter(policy, eqx.is_array)) # Tells optim
 
 ### LOSS FUNCTION ###
 
-# Stateless, pure loss function (preferred in JAX) #! Good loss fn example!
-# def loss_fn(model, x, y, weight=1.0):
-#     pred = model(x)
-#     return weight * jnp.mean((pred - y) ** 2)
-
-# @eqx.filter_jit
-# def make_step(model, opt_state, x, y, optimizer): #! Good make_step fn example!
-#     loss, grads = eqx.filter_value_and_grad(loss_fn)(model, x, y, 0.5)
-#     updates, opt_state = optimizer.update(grads, opt_state, params=model)
-#     model = eqx.apply_updates(model, updates)
-#     return model, opt_state, loss
-
-def policy_gradient_loss(model):
-    pass
+def model_flow_matching_loss(
+    model: Policy, 
+    loginflow: Float[Array, ""], # Scalar from jax.numpy
+    state: int, 
+    children: Int[Array, "n"] # 1D array
+) -> Float[Array, ""]:
+    outflow_logits = jax.vmap(model)(jnp.array([state]))[children]
+    logoutflow = jax.nn.logsumexp(outflow_logits)
+    return jnp.square(logoutflow - loginflow)
     
+@eqx.filter_jit # Decorator to Just In Time (JIT) compile the function for speed
+def make_step(model, opt_state, optimizer,  loginflow, state, children): 
+    loss, grads = eqx.filter_value_and_grad(model_flow_matching_loss)(model, loginflow, state, children) # Computes the loss and its gradients w.r.t. model parameters
+    updates, opt_state = optimizer.update(grads, opt_state, params=model) # Does the auto-diff and computes the updates
+    model = eqx.apply_updates(model, updates) # Equivalent of optimizer.step() in PyTorch
+    return model, opt_state, loss
     
 ### GRAPH MASKS ###
 
@@ -130,12 +130,155 @@ for state in range(n_states):
     mask_dict[state] = mask_invalid
     
 ### TRAIN ###
+def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransformation, optimizer_state: optax.OptState):
+    if not do_print:
+        pbar = tqdm(
+            initial=0,
+            total=n_train_steps,
+        )
 
-if not do_print:
-    pbar = tqdm(
-        initial=0,
-        total=n_train_steps // batch_size,
-    )
+    start_time = time.time()
 
-start_time = time.time()
+    for step in range(n_train_steps):
+        
+        # Initialize a trajectory with state 0 and trajectory not done
+        state = 0
+        traj_done = False
+        n_steps = 0
+
+        # Initialize loss to zero
+        loss = 0.0
+
+        if do_print:
+            print(f"\nIteration {step}")
+            print(f"\tTrajectory 0 -> ", end="")
+
+        # Sample actions until trajectory is done
+        while not traj_done:
+
+            # Build the mask of invalid actions from the current state
+            mask_invalid = jnp.array(mask_dict[state])
+
+            # Obtain policy log-flows from the current state, mask invalid actions and
+            # sample action
+            key, subkey = random.split(key)
+            logits_sampled = vmap(policy)(jnp.array([state]))
+            logits_sampled = jnp.where(mask_invalid, -jnp.inf, logits_sampled) # Mask invalid actions
+            action = random.categorical(subkey, logits_sampled) 
+            n_steps += 1
+
+            # Update state, flag of done trajectory and get reward
+            if action == n_states:
+                traj_done = True
+                reward = rewards_dict[state]
+                if do_print:
+                    print(f"EOS (reward {reward})")
+            else:
+                state = int(action[0])
+                reward = 0
+                if do_print:
+                    print(f"{action} -> ", end="")
+                    
+            # Obtain in-flows:
+            # - Get parents of state
+            # - Obtain log-flows from each parent to state
+            # - Take the log of the sum of the exponential log-flows
+            if traj_done:
+                parents = [state]
+            else:
+                parents = [s for s in range(n_states) if state in connections_dict[s]]
+            parents = jnp.array(
+                parents,
+                dtype=jnp.int32,
+            )
+            inflows_logits = jax.vmap(policy)(parents)[:, action]
+            loginflow = jax.nn.logsumexp(inflows_logits)
+            
+            # Obtain out-flows:
+            # - Obtain children of state
+            # - Obtain log-flows from the state and mask out transitions that are not
+            # children
+            # - Take the log of the sum of the exponential log-flows
+            # - If the trajectory is done, the log-outflow is just the log-reward
+            if traj_done:
+                logoutflow = jnp.log(jnp.array(reward, dtype=float_type))
+            else:
+                children = jnp.array(connections_dict[state], dtype=jnp.int32)
+                outflow_logits = jax.vmap(policy)(jnp.array([state], dtype=jnp.int32))[children]
+                logoutflow = jax.nn.logsumexp(outflow_logits, axis=0)
+
+            # Compute Flow Matching loss
+            loss = model_flow_matching_loss(policy, loginflow, state, children) + loss
+        
+        loss /= n_steps # Average loss per step
+        policy, optimizer_state, loss = make_step(policy, optimizer_state, optimizer, loginflow, state, children) # Update model parameters
+        
+        if do_print:
+            print(f"\tTotal loss: {loss:.4f}")
+        if not do_print:
+            pbar.update(1)
+            pbar.set_description(f"Loss: {loss:.4f}")
+        
+### EVALUATE ###
+
+def eval(key: random.PRNGKey, policy: Policy):
+    n_samples = 2000
+
+    # A dictionary to count the number of times each terminal state is sampled
+    samples_dict = {
+        3: 0,
+        4: 0,
+        6: 0,
+        8: 0,
+        9: 0,
+        10: 0,
+    }
+
+    for step in range(n_samples):
+        
+        # Initialize a trajectory with state 0 and trajectory not done
+        state = 0
+        traj_done = False
+        
+        # Sample actions until trajectory is done
+        while not traj_done:
+            
+            # Build the mask of invalid actions from the current state
+            mask_invalid = jnp.array(mask_dict[state])
+            
+            # Obtain policy log-flows from the current state, mask invalid actions and
+            # sample action
+            key, subkey = random.split(key)
+            logits_sampled = vmap(policy)(jnp.array([state]))
+            logits_sampled = jnp.where(mask_invalid, -jnp.inf, logits_sampled)
+            action = random.categorical(subkey, logits_sampled)
+            
+            # Update state, flag of done trajectory and get reward
+            if action == n_states:
+                traj_done = True
+                samples_dict[state] += 1
+            else:
+                state = int(action[0])
+
+    # Print results
+    print("\nEvaluation: \n")
+    z = sum(rewards_dict.values())
+    absolute_error = 0.0
+    for sample, count in samples_dict.items():
+        p_sampled = count / n_samples
+        p_true = rewards_dict[sample] / z
+        absolute_error += abs(p_sampled - p_true)
+        print(
+            "- Sample {:2d} was generated with probability {:.2f} and the "
+            "actual probability is {:.2f}".format(sample, p_sampled, p_true)
+        )
+    mae = absolute_error / len(samples_dict)
+    print("Mean absolute error: {:.2f}".format(mae))
+
+if __name__ == "__main__":
+    start = time.perf_counter(); train(key, policy, optimizer, optimizer_state); print(f"Training: {time.perf_counter() - start:.2f}s")
+    start = time.perf_counter(); eval(key, policy); print(f"Evaluation: {time.perf_counter() - start:.2f}s")
+
+
+    
 
