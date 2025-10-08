@@ -196,7 +196,7 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
             # sample action
             logits_sampled = policy(state)
             logits_masked = jnp.where(jnp.array(mask_invalid), -jnp.inf, logits_sampled) # Mask invalid actions
-            action = random.categorical(subkey, logits_masked) 
+            action = int(random.categorical(subkey, logits_masked))
             n_steps += 1
 
             # Update state, flag of done trajectory and get reward
@@ -206,7 +206,7 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
                 if do_print:
                     print(f"EOS (reward {reward})")
             else:
-                state = action.item()
+                state = action
                 reward = 0
                 if do_print:
                     print(f"{action} -> ", end="")
@@ -220,8 +220,8 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
             else:
                 parents = [s for s in range(n_states) if state in connections_dict[s]]
 
-            parents = jnp.array(parents,dtype=jnp.int32)
-            inflows_logits = jax.vmap(policy)(parents)[:, action]
+            #inflows_logits = jax.vmap(policy)(parents)[:, action]
+            inflows_logits = jnp.array([policy(parent)[action] for parent in parents])
             loginflow = jax.nn.logsumexp(inflows_logits)
             
             # Obtain out-flows:
@@ -323,7 +323,7 @@ if __name__ == "__main__":
     # start = time.perf_counter(); train(key, policy, optimizer, optimizer_state); print(f"Training: {time.perf_counter() - start:.2f}s")
     # start = time.perf_counter(); eval(key, policy); print(f"Evaluation: {time.perf_counter() - start:.2f}s")
     
-    # Start JAX profiler server (view at http://localhost:9999)
+    #! Wouldn't recommend using profiler.trace 
     # jax.profiler.start_trace("/tmp/jax-trace", create_perfetto_link=True)
     # train(key, policy, optimizer, optimizer_state)
     # jax.profiler.stop_trace()
