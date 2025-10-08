@@ -20,7 +20,13 @@ Key differences with gfn.py:
 import jax
 import jax.numpy as jnp
 from jax import random, grad, jit, vmap
-from jaxtyping import Array, Float, Int, Scalar
+from jaxtyping import Array, Float, Int
+import jax.profiler
+
+
+import cProfile
+import pstats
+from pstats import SortKey
 
 
 import optax
@@ -87,7 +93,7 @@ class Policy(eqx.Module):
             key=key2,
         )
 
-    def __call__(self, x):
+    def __call__(self, x: int) -> Float[Array, "n_actions"]:
         x = self.embedding(x)
         x = self.linear(x)
         return x
@@ -108,17 +114,39 @@ def model_flow_matching_loss(
     model: Policy, 
     loginflow: Float[Array, ""], # Scalar from jax.numpy
     state: int, 
-    children: Int[Array, "n"] # 1D array
+    children: Int[Array, "n_states"], # 1D array
+    n_valid_children: int
 ) -> Float[Array, ""]:
-    outflow_logits = jax.vmap(model)(jnp.array([state]))[children]
+    valid_children = children[:n_valid_children]  
+    # outflow_logits = jax.vmap(model)(state)[children]
+    outflow_logits = model(state)[valid_children] 
     logoutflow = jax.nn.logsumexp(outflow_logits)
     return jnp.square(logoutflow - loginflow)
     
-@eqx.filter_jit # Decorator to Just In Time (JIT) compile the function for speed
-def make_step(model, opt_state, optimizer,  loginflow, state, children): 
-    loss, grads = eqx.filter_value_and_grad(model_flow_matching_loss)(model, loginflow, state, children) # Computes the loss and its gradients w.r.t. model parameters
+# Decorator to Just In Time (JIT) compile the function for speed
+@eqx.filter_jit
+def make_step(model, opt_state, optimizer,  loginflow, state, children, n_children): 
+    loss, grads = eqx.filter_value_and_grad(model_flow_matching_loss)(model, loginflow, state, children, n_children) # Computes the loss and its gradients w.r.t. model parameters
     updates, opt_state = optimizer.update(grads, opt_state, params=model) # Does the auto-diff and computes the updates
     model = eqx.apply_updates(model, updates) # Equivalent of optimizer.step() in PyTorch
+    return model, opt_state, loss
+
+@eqx.filter_jit
+def compute_trajectory_loss_and_update(
+    model, opt_state, optimizer,
+    loginflows: Float[Array, "n_steps"],
+    logoutflows: Float[Array, "n_steps"],
+    n_steps: int
+):
+    # Compute flow matching loss for entire trajectory
+    losses = jnp.square(logoutflows - loginflows)
+    loss = jnp.sum(losses) / n_steps
+    
+    # Compute gradients and update
+    grads = eqx.filter_grad(lambda m: loss)(model)
+    updates, opt_state = optimizer.update(grads, opt_state, params=model)
+    model = eqx.apply_updates(model, updates)
+    
     return model, opt_state, loss
     
 ### GRAPH MASKS ###
@@ -137,7 +165,8 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
             total=n_train_steps,
         )
 
-    start_time = time.time()
+    key, *subkeys = random.split(key, n_train_steps * n_states) 
+    key_idx = 0
 
     for step in range(n_train_steps):
         
@@ -155,16 +184,19 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
 
         # Sample actions until trajectory is done
         while not traj_done:
+            
+            # Use pre-generated key
+            subkey = subkeys[key_idx]
+            key_idx += 1
 
             # Build the mask of invalid actions from the current state
-            mask_invalid = jnp.array(mask_dict[state])
+            mask_invalid = mask_dict[state]
 
             # Obtain policy log-flows from the current state, mask invalid actions and
             # sample action
-            key, subkey = random.split(key)
-            logits_sampled = vmap(policy)(jnp.array([state]))
-            logits_sampled = jnp.where(mask_invalid, -jnp.inf, logits_sampled) # Mask invalid actions
-            action = random.categorical(subkey, logits_sampled) 
+            logits_sampled = policy(state)
+            logits_masked = jnp.where(jnp.array(mask_invalid), -jnp.inf, logits_sampled) # Mask invalid actions
+            action = random.categorical(subkey, logits_masked) 
             n_steps += 1
 
             # Update state, flag of done trajectory and get reward
@@ -174,7 +206,7 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
                 if do_print:
                     print(f"EOS (reward {reward})")
             else:
-                state = int(action[0])
+                state = action.item()
                 reward = 0
                 if do_print:
                     print(f"{action} -> ", end="")
@@ -187,10 +219,8 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
                 parents = [state]
             else:
                 parents = [s for s in range(n_states) if state in connections_dict[s]]
-            parents = jnp.array(
-                parents,
-                dtype=jnp.int32,
-            )
+
+            parents = jnp.array(parents,dtype=jnp.int32)
             inflows_logits = jax.vmap(policy)(parents)[:, action]
             loginflow = jax.nn.logsumexp(inflows_logits)
             
@@ -200,19 +230,33 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
             # children
             # - Take the log of the sum of the exponential log-flows
             # - If the trajectory is done, the log-outflow is just the log-reward
+            # Prepare padded children (ALWAYS, even when done)
             if traj_done:
-                logoutflow = jnp.log(jnp.array(reward, dtype=float_type))
+                children_padded = jnp.zeros(n_states, dtype=jnp.int32)
+                n_children = 0
+                logoutflow = jnp.log(float(reward))
             else:
-                children = jnp.array(connections_dict[state], dtype=jnp.int32)
-                outflow_logits = jax.vmap(policy)(jnp.array([state], dtype=jnp.int32))[children]
-                logoutflow = jax.nn.logsumexp(outflow_logits, axis=0)
+                children_list = connections_dict[state]
+                n_children = len(children_list)
+                children_padded = jnp.pad(
+                    jnp.array(children_list, dtype=jnp.int32),
+                    (0, n_states - n_children), #(before, after)
+                    mode='constant',
+                    constant_values=0
+                )
+                outflow_logits = policy(state)[children_padded[:n_children]]
+                logoutflow = jax.nn.logsumexp(outflow_logits)
 
-            # Compute Flow Matching loss
-            loss = model_flow_matching_loss(policy, loginflow, state, children) + loss
+            # Accumulate loss inline (simpler than calling make_step)
+            loss = loss + jnp.square(logoutflow - loginflow)
         
-        loss /= n_steps # Average loss per step
-        policy, optimizer_state, loss = make_step(policy, optimizer_state, optimizer, loginflow, state, children) # Update model parameters
+        loss /= n_steps
         
+        # Use make_step ONLY for gradient update with the last step's data
+        policy, optimizer_state, _ = make_step(
+            policy, optimizer_state, optimizer, 
+            loginflow, state, children_padded, n_children
+        )
         if do_print:
             print(f"\tTotal loss: {loss:.4f}")
         if not do_print:
@@ -276,8 +320,28 @@ def eval(key: random.PRNGKey, policy: Policy):
     print("Mean absolute error: {:.2f}".format(mae))
 
 if __name__ == "__main__":
-    start = time.perf_counter(); train(key, policy, optimizer, optimizer_state); print(f"Training: {time.perf_counter() - start:.2f}s")
-    start = time.perf_counter(); eval(key, policy); print(f"Evaluation: {time.perf_counter() - start:.2f}s")
+    # start = time.perf_counter(); train(key, policy, optimizer, optimizer_state); print(f"Training: {time.perf_counter() - start:.2f}s")
+    # start = time.perf_counter(); eval(key, policy); print(f"Evaluation: {time.perf_counter() - start:.2f}s")
+    
+    # Start JAX profiler server (view at http://localhost:9999)
+    # jax.profiler.start_trace("/tmp/jax-trace", create_perfetto_link=True)
+    # train(key, policy, optimizer, optimizer_state)
+    # jax.profiler.stop_trace()
+    # print("Trace saved. Open the Perfetto link printed above.")
+    
+    # Profile training
+    profiler = cProfile.Profile()
+    profiler.enable()
+    train(key, policy, optimizer, optimizer_state)
+    profiler.disable()
+    
+    # Print results sorted by cumulative time
+    stats = pstats.Stats(profiler)
+    stats.sort_stats(SortKey.CUMULATIVE)
+    stats.print_stats(20)  # Show top 20 functions
+    
+    
+    
 
 
     
