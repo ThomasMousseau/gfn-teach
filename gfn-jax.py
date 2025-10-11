@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 from jax import random, grad, jit, vmap
 from jaxtyping import Array, Float, Int
-import jax.profiler
 
 
 import cProfile
@@ -131,7 +130,7 @@ def make_step(model, opt_state, optimizer,  loginflow, state, children, n_childr
     model = eqx.apply_updates(model, updates) # Equivalent of optimizer.step() in PyTorch
     return model, opt_state, loss
 
-@eqx.filter_jit
+
 def compute_trajectory_loss_and_update(
     model, opt_state, optimizer,
     loginflows: Float[Array, "n_steps"],
@@ -168,7 +167,7 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
     key, *subkeys = random.split(key, n_train_steps * n_states) 
     key_idx = 0
 
-    for step in range(n_train_steps):
+    for step in range(n_train_steps): #! Should this be a jax.lax.scan?
         
         # Initialize a trajectory with state 0 and trajectory not done
         state = 0
@@ -253,10 +252,10 @@ def train(key: random.PRNGKey, policy: Policy, optimizer: optax.GradientTransfor
         loss /= n_steps
         
         # Use make_step ONLY for gradient update with the last step's data
-        policy, optimizer_state, _ = make_step(
-            policy, optimizer_state, optimizer, 
-            loginflow, state, children_padded, n_children
-        )
+        grads = eqx.filter_grad(lambda m: loss)(policy)
+        updates, optimizer_state = optimizer.update(grads, optimizer_state, params=policy)
+        policy = eqx.apply_updates(policy, updates)
+        
         if do_print:
             print(f"\tTotal loss: {loss:.4f}")
         if not do_print:
