@@ -141,82 +141,87 @@ optimizer = optax.sgd(learning_rate=learning_rate, momentum=momentum)
 ### TRAJECTORY SAMPLING ###
 
 class TrajStepCarry(NamedTuple):
-    state: Int[Array, ""]
+    policy: Policy  # Add policy to the carry
+    state: Int[Array, ""] 
     done: Int[Array, ""]
     step_count: Int[Array, ""]
     total_loss: Float[Array, ""]
     key: jax.Array
 
-def make_trajectory_step(policy_model):
-    """Create a trajectory step function that closes over the policy."""
-    def trajectory_step(carry: TrajStepCarry, _) -> tuple[TrajStepCarry, None]:
-        """Single step in trajectory sampling."""
-        state, done, step_count, total_loss, key = carry
-        key, subkey = random.split(key)
-        
-        # Get logits and sample action
-        mask_invalid = mask_array[state]
-        logits = policy_model(state)
-        logits_masked = jnp.where(mask_invalid, -jnp.inf, logits)
-        action = random.categorical(subkey, logits_masked)
-        
-        # Determine if this is an EOS action
-        is_eos = action == n_states
-        
-        # Next state (stays same if EOS)
-        next_state = jnp.where(is_eos, state, action)
-        
-        # Get reward
-        reward = rewards_array[state]
-        
-        # Compute inflow (vectorized over parents)
-        parents_for_action = parent_indices[next_state, action]
-        n_p = n_parents[next_state, action]
-        
-        # Vectorized computation of parent logits
-        def get_parent_logit(parent_idx):
-            return policy_model(parent_idx)[action]
-        
-        parent_logits = vmap(get_parent_logit)(parents_for_action)
-        
-        # Mask out invalid parents (beyond n_p)
-        parent_mask = jnp.arange(max_parents) >= n_p
-        parent_logits = jnp.where(parent_mask, -jnp.inf, parent_logits)
-        loginflow = jax.nn.logsumexp(parent_logits)
-        
-        # Compute outflow
-        def compute_outflow_non_eos():
-            children = children_indices[state]
-            n_c = n_children_array[state]
-            child_logits = policy_model(state)[children]
-            child_mask = jnp.arange(max_children) >= n_c
-            child_logits = jnp.where(child_mask, -jnp.inf, child_logits)
-            return jax.nn.logsumexp(child_logits)
-        
-        logoutflow = jnp.where(
-            is_eos,
-            jnp.log(reward + 1e-10),
-            compute_outflow_non_eos()
-        )
-        
-        # Compute step loss (only if not already done)
-        step_loss = jnp.square(logoutflow - loginflow)
-        total_loss = jnp.where(done, total_loss, total_loss + step_loss)
-        step_count = jnp.where(done, step_count, step_count + 1)
-        
-        # Update done flag
-        done = done | is_eos
-        
-        new_carry = TrajStepCarry(next_state, done, step_count, total_loss, key)
-        return new_carry, None
+def trajectory_step(carry: TrajStepCarry, _) -> tuple[TrajStepCarry, None]: #! signature is weird but required by jax.lax.scan
+    """Single step in trajectory sampling. Policy is extracted from carry."""
+    policy = carry.policy  # Extract policy from carry
+    state, done, step_count, total_loss, key = carry.state, carry.done, carry.step_count, carry.total_loss, carry.key
+    key, subkey = random.split(key)
     
-    return trajectory_step
+    # Get logits and sample action
+    mask_invalid = mask_array[state]
+    logits = policy(state)  # Use extracted policy
+    logits_masked = jnp.where(mask_invalid, -jnp.inf, logits)
+    action = random.categorical(subkey, logits_masked)
+    
+    # Determine if this is an EOS action
+    is_eos = action == n_states
+    
+    # Next state (stays same if EOS)
+    next_state = jnp.where(is_eos, state, action)
+    
+    # Get reward
+    reward = rewards_array[state]
+    
+    # Compute inflow (vectorized over parents)
+    parents_for_action = parent_indices[next_state, action]
+    n_p = n_parents[next_state, action]
+    
+    # Vectorized computation of parent logits
+    def get_parent_logit(parent_idx):
+        return policy(parent_idx)[action]  
+    
+    parent_logits = vmap(get_parent_logit)(parents_for_action) #! vmap is used since parents_for_action is an array
+    
+    # Mask out invalid parents (beyond n_p)
+    parent_mask = jnp.arange(max_parents) >= n_p
+    parent_logits = jnp.where(parent_mask, -jnp.inf, parent_logits)
+    loginflow = jax.nn.logsumexp(parent_logits)
+    
+    # Compute outflow
+    def compute_outflow_non_eos():
+        children = children_indices[state]
+        n_c = n_children_array[state]
+        child_logits = policy(state)[children]  #! did not use vmap here since children state is a scalar
+        child_mask = jnp.arange(max_children) >= n_c
+        child_logits = jnp.where(child_mask, -jnp.inf, child_logits)
+        return jax.nn.logsumexp(child_logits)
+    
+    logoutflow = jnp.where(
+        is_eos,
+        jnp.log(reward + 1e-10),
+        compute_outflow_non_eos()
+    )
+    
+    # Compute step loss (only if not already done)
+    step_loss = jnp.square(logoutflow - loginflow)
+    total_loss = jnp.where(done, total_loss, total_loss + step_loss)
+    step_count = jnp.where(done, step_count, step_count + 1)
+    
+    # Update done flag
+    done = done | is_eos
+    
+    # Return new carry with policy unchanged (it's the same throughout trajectory)
+    new_carry = TrajStepCarry(
+        policy=policy,  # Keep the same policy
+        state=next_state,
+        done=done,
+        step_count=step_count,
+        total_loss=total_loss,
+        key=key
+    )
+    return new_carry, None
 
 def sample_trajectory(policy_model, key, max_steps=50):
     """Sample a complete trajectory and compute its loss."""
-    trajectory_step = make_trajectory_step(policy_model)
-    
     init_carry = TrajStepCarry(
+        policy=policy_model,  # Pass policy in carry
         state=jnp.array(0, dtype=jnp.int32),
         done=jnp.array(0, dtype=jnp.int32),
         step_count=jnp.array(0, dtype=jnp.int32),
